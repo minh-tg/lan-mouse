@@ -1,6 +1,6 @@
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
+use local_channel::mpsc::{Receiver as LocalReceiver, Sender as LocalSender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, VecDeque},
@@ -11,7 +11,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, mpsc},
     task::{JoinHandle, spawn_local},
 };
 use webrtc_dtls::{
@@ -52,13 +52,19 @@ pub(crate) enum ListenEvent {
     },
 }
 
+/// Bounds messages waiting between DTLS readers and the emulation dispatcher.
+const LISTEN_EVENT_QUEUE_CAPACITY: usize = 1024;
+
+fn listen_event_channel() -> (mpsc::Sender<ListenEvent>, mpsc::Receiver<ListenEvent>) {
+    mpsc::channel(LISTEN_EVENT_QUEUE_CAPACITY)
+}
+
 pub(crate) struct LanMouseListener {
-    listen_rx: Receiver<ListenEvent>,
-    listen_tx: Sender<ListenEvent>,
+    listen_rx: mpsc::Receiver<ListenEvent>,
     listen_task: JoinHandle<()>,
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
-    request_port_change: Sender<u16>,
-    port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    request_port_change: LocalSender<u16>,
+    port_changed: LocalReceiver<Result<u16, ListenerCreationError>>,
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -73,7 +79,7 @@ impl LanMouseListener {
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, ListenerCreationError> {
-        let (listen_tx, listen_rx) = channel();
+        let (listen_tx, listen_rx) = listen_event_channel();
         let (request_port_change, mut request_port_change_rx) = channel();
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
@@ -134,11 +140,14 @@ impl LanMouseListener {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let mut conns = conns_clone.lock().await;
                                 conns.push((addr, conn.clone()));
+                                drop(conns);
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
+                                if listen_tx.send(ListenEvent::Accept { addr, fingerprint }).await.is_err() {
+                                    return;
+                                }
                                 spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
                             },
                             Err(e) => {
@@ -146,8 +155,11 @@ impl LanMouseListener {
                                     if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
+                                                let fingerprint = connection_attempts.lock().expect("lock").pop_front();
+                                                if let Some(fingerprint) = fingerprint {
+                                                    if listen_tx.send(ListenEvent::Rejected { fingerprint }).await.is_err() {
+                                                        return;
+                                                    }
                                                 }
                                             }
                                             _ => log::warn!("accept: {e}"),
@@ -183,7 +195,6 @@ impl LanMouseListener {
         Ok(Self {
             conns,
             listen_rx,
-            listen_tx,
             listen_task,
             port_changed,
             request_port_change,
@@ -199,34 +210,44 @@ impl LanMouseListener {
     }
 
     pub(crate) async fn terminate(&mut self) {
+        self.listen_rx.close();
         self.listen_task.abort();
-        let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
+        let conns = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .map(|(_, conn)| conn.clone())
+            .collect::<Vec<_>>();
+        for conn in conns {
             let _ = conn.close().await;
         }
-        self.listen_tx.close();
     }
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
-            }
-        }
-    }
-
-    pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
+        let conn = self
             .conns
             .lock()
             .await
             .iter()
             .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
+            .map(|(_, conn)| conn.clone());
+        if let Some(conn) = conn {
+            let _ = conn.send(&buf[..len]).await;
+        }
+    }
+
+    pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
+        let conn = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone());
+        if let Some(conn) = conn {
             let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
             let certs = conn.connection_state().await.peer_certificates;
             let cert = certs.first()?;
@@ -245,7 +266,7 @@ impl Stream for LanMouseListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.listen_rx.poll_next_unpin(cx)
+        self.listen_rx.poll_recv(cx)
     }
 }
 
@@ -253,15 +274,21 @@ async fn read_loop(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     addr: SocketAddr,
     conn: ArcConn,
-    dtls_tx: Sender<ListenEvent>,
+    dtls_tx: mpsc::Sender<ListenEvent>,
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_EVENT_SIZE];
 
     while conn.recv(&mut b).await.is_ok() {
         match b.try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+            Ok(event) => {
+                if dtls_tx
+                    .send(ListenEvent::Msg { event, addr })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -279,7 +306,7 @@ async fn read_loop(
     log::info!("dtls client disconnected {addr:?}");
     // Report the real close so the emulation side can prune per-address
     // bookkeeping (e.g. an overflow block) instead of retaining it forever.
-    let _ = dtls_tx.send(ListenEvent::Closed { addr });
+    let _ = dtls_tx.send(ListenEvent::Closed { addr }).await;
     let mut conns = conns.lock().await;
     let index = conns
         .iter()
@@ -287,4 +314,70 @@ async fn read_loop(
         .expect("connection not found");
     conns.remove(index);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        future::Future,
+        task::{Context, Poll},
+    };
+
+    fn rejected(fingerprint: impl Into<String>) -> ListenEvent {
+        ListenEvent::Rejected {
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    fn fill(tx: &mpsc::Sender<ListenEvent>) {
+        for index in 0..LISTEN_EVENT_QUEUE_CAPACITY {
+            assert!(tx.try_send(rejected(index.to_string())).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_queue_backpressures_producers() {
+        let (tx, mut rx) = listen_event_channel();
+        fill(&tx);
+        assert!(matches!(
+            tx.try_send(rejected("overflow")),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        let mut send = Box::pin(tx.send(rejected("pending")));
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(send.as_mut().poll(&mut context), Poll::Pending));
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ListenEvent::Rejected { fingerprint }) if fingerprint == "0"
+        ));
+        assert!(send.await.is_ok());
+        for expected in 1..LISTEN_EVENT_QUEUE_CAPACITY {
+            assert!(matches!(
+                rx.recv().await,
+                Some(ListenEvent::Rejected { fingerprint }) if fingerprint == expected.to_string()
+            ));
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Some(ListenEvent::Rejected { fingerprint }) if fingerprint == "pending"
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_listener_queue_unblocks_waiting_producers() {
+        let (tx, mut rx) = listen_event_channel();
+        fill(&tx);
+
+        let mut send = Box::pin(tx.send(rejected("pending")));
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(send.as_mut().poll(&mut context), Poll::Pending));
+
+        rx.close();
+        assert!(send.await.is_err());
+    }
 }
