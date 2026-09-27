@@ -91,11 +91,18 @@ enum TrackedTransition {
     ReleasePending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputAction {
+    Ignore,
+    Send,
+    Retry,
+}
+
 /// Input that has been handed to the backend for a single [`EmulationHandle`].
 ///
-/// Pending transitions are retained across cancellation so an essential event replayed by
-/// the caller can be submitted again. Confirmed presses remain tracked until a confirmed
-/// release or cleanup, so an uncertain/cancelled release is safely retried.
+/// Pending transitions are retained across cancellation so the caller can resume them.
+/// A backend may flush an already-buffered event instead of sending it twice. Confirmed
+/// presses remain tracked until a confirmed release or cleanup.
 #[derive(Default)]
 struct TrackedInput {
     keys: HashMap<u32, TrackedTransition>,
@@ -170,20 +177,28 @@ impl InputEmulation {
     ) -> Result<(), EmulationError> {
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
-                // suppress duplicate presses and unmatched releases
-                if !self.track_key(handle, key, state) {
-                    return Ok(());
-                }
-                self.emulation.consume(event, handle).await?;
+                // Ignore confirmed duplicate presses and unmatched releases. If a previous
+                // backend call was cancelled, let that backend resume it without resending
+                // the event when it already buffers writes (as libei does).
+                let action = self.track_key(handle, key, state);
+                let result = match action {
+                    InputAction::Ignore => return Ok(()),
+                    InputAction::Send => self.emulation.consume(event, handle).await,
+                    InputAction::Retry => self.emulation.retry_pending(event, handle).await,
+                };
+                result?;
                 self.complete_key_transition(handle, key, state);
                 Ok(())
             }
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
-                // suppress duplicate presses and unmatched releases
-                if !self.track_button(handle, button, state) {
-                    return Ok(());
-                }
-                self.emulation.consume(event, handle).await?;
+                // Use the same cancellation handling for pointer buttons as for keys.
+                let action = self.track_button(handle, button, state);
+                let result = match action {
+                    InputAction::Ignore => return Ok(()),
+                    InputAction::Send => self.emulation.consume(event, handle).await,
+                    InputAction::Retry => self.emulation.retry_pending(event, handle).await,
+                };
+                result?;
                 self.complete_button_transition(handle, button, state);
                 Ok(())
             }
@@ -289,28 +304,37 @@ impl InputEmulation {
             .is_some_and(|tracked| !tracked.keys.is_empty())
     }
 
-    /// Record an incoming key transition and report whether it must be forwarded.
+    /// Track an incoming key transition and choose whether to send or retry it.
     ///
-    /// Confirmed duplicate presses and unmatched releases are suppressed. A pending press
-    /// or release is forwarded again when the caller replays it after cancellation.
-    fn track_key(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {
+    /// Confirmed duplicate presses and unmatched releases are suppressed. Pending
+    /// transitions use the backend's retry behavior after cancellation.
+    fn track_key(&mut self, handle: EmulationHandle, key: u32, state: u8) -> InputAction {
         let Some(tracked) = self.handles.get_mut(&handle) else {
-            return false;
+            return InputAction::Ignore;
         };
         if state == 0 {
             let Some(transition) = tracked.keys.get_mut(&key) else {
-                return false;
+                return InputAction::Ignore;
+            };
+            let action = if *transition == TrackedTransition::ReleasePending {
+                InputAction::Retry
+            } else {
+                InputAction::Send
             };
             *transition = TrackedTransition::ReleasePending;
-            true
+            action
         } else {
             match tracked.keys.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(TrackedTransition::PressPending);
-                    true
+                    InputAction::Send
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    *entry.get() == TrackedTransition::PressPending
+                    if *entry.get() == TrackedTransition::PressPending {
+                        InputAction::Retry
+                    } else {
+                        InputAction::Ignore
+                    }
                 }
             }
         }
@@ -328,24 +352,33 @@ impl InputEmulation {
     }
 
     /// Same contract as [`track_key`](Self::track_key) for pointer buttons.
-    fn track_button(&mut self, handle: EmulationHandle, button: u32, state: u32) -> bool {
+    fn track_button(&mut self, handle: EmulationHandle, button: u32, state: u32) -> InputAction {
         let Some(tracked) = self.handles.get_mut(&handle) else {
-            return false;
+            return InputAction::Ignore;
         };
         if state == 0 {
             let Some(transition) = tracked.buttons.get_mut(&button) else {
-                return false;
+                return InputAction::Ignore;
+            };
+            let action = if *transition == TrackedTransition::ReleasePending {
+                InputAction::Retry
+            } else {
+                InputAction::Send
             };
             *transition = TrackedTransition::ReleasePending;
-            true
+            action
         } else {
             match tracked.buttons.entry(button) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(TrackedTransition::PressPending);
-                    true
+                    InputAction::Send
                 }
                 std::collections::hash_map::Entry::Occupied(entry) => {
-                    *entry.get() == TrackedTransition::PressPending
+                    if *entry.get() == TrackedTransition::PressPending {
+                        InputAction::Retry
+                    } else {
+                        InputAction::Ignore
+                    }
                 }
             }
         }
@@ -411,6 +444,15 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
+    /// Resume a cancelled transition. Backends that buffer output before awaiting can
+    /// flush the existing buffer instead of submitting the same transition twice.
+    async fn retry_pending(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        self.consume(event, handle).await
+    }
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
@@ -433,10 +475,15 @@ mod tests {
     #[derive(Default)]
     struct MockControl {
         consumed: Vec<(EmulationHandle, Event)>,
+        retried: Vec<(EmulationHandle, Event)>,
         destroyed: Vec<EmulationHandle>,
         terminated: bool,
         /// `consume` waits forever for this event instead of recording it
         stall_on: Option<Event>,
+        /// `consume` records this event and then waits forever
+        stall_after_record: Option<Event>,
+        /// Model a backend whose pending event is already buffered on retry
+        retry_without_resend: bool,
         /// `consume` records this event and then returns an error
         fail_on: Option<Event>,
         /// `destroy`/`terminate` wait forever
@@ -473,7 +520,10 @@ mod tests {
                     (true, false)
                 } else {
                     control.consumed.push((handle, event));
-                    (false, control.fail_on == Some(event))
+                    (
+                        control.stall_after_record == Some(event),
+                        control.fail_on == Some(event),
+                    )
                 }
             };
             if stall {
@@ -483,6 +533,23 @@ mod tests {
                 return Err(EmulationError::EndOfStream);
             }
             Ok(())
+        }
+
+        async fn retry_pending(
+            &mut self,
+            event: Event,
+            handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            let retry_without_resend = {
+                let mut control = self.control.lock().unwrap();
+                control.retried.push((handle, event));
+                control.retry_without_resend
+            };
+            if retry_without_resend {
+                Ok(())
+            } else {
+                self.consume(event, handle).await
+            }
         }
 
         async fn create(&mut self, _: EmulationHandle) {}
@@ -646,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_press_is_forwarded_again_when_replayed() {
+    async fn default_retry_resends_cancelled_press() {
         let (_, control) = MockEmulation::new();
         let mut emulation = emulation_with(&control);
         emulation.create(0).await;
@@ -662,6 +729,7 @@ mod tests {
         control.lock().unwrap().stall_on = None;
         emulation.consume(press, 0).await.unwrap();
         assert_eq!(consumed(&control), vec![(0, press)]);
+        assert_eq!(control.lock().unwrap().retried, vec![(0, press)]);
         assert!(emulation.has_pressed_keys(0));
 
         let button_press = button_event(BTN_LEFT, 1);
@@ -675,10 +743,39 @@ mod tests {
         control.lock().unwrap().stall_on = None;
         emulation.consume(button_press, 0).await.unwrap();
         assert_eq!(consumed(&control), vec![(0, press), (0, button_press)]);
+        assert_eq!(
+            control.lock().unwrap().retried,
+            vec![(0, press), (0, button_press)]
+        );
     }
 
     #[tokio::test]
-    async fn cancelled_button_release_is_forwarded_again_when_replayed() {
+    async fn buffered_transition_retry_does_not_send_a_duplicate() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+
+        let press = key_event(30, 1);
+        {
+            let mut control = control.lock().unwrap();
+            control.stall_after_record = Some(press);
+            control.retry_without_resend = true;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), emulation.consume(press, 0))
+                .await
+                .is_err()
+        );
+
+        control.lock().unwrap().stall_after_record = None;
+        emulation.consume(press, 0).await.unwrap();
+        assert_eq!(consumed(&control), vec![(0, press)]);
+        assert_eq!(control.lock().unwrap().retried, vec![(0, press)]);
+        assert!(emulation.has_pressed_keys(0));
+    }
+
+    #[tokio::test]
+    async fn default_retry_resends_cancelled_button_release() {
         let (_, control) = MockEmulation::new();
         let mut emulation = emulation_with(&control);
         emulation.create(0).await;
@@ -697,6 +794,7 @@ mod tests {
         control.lock().unwrap().stall_on = None;
         emulation.consume(release, 0).await.unwrap();
         assert_eq!(consumed(&control), vec![(0, press), (0, release)]);
+        assert_eq!(control.lock().unwrap().retried, vec![(0, release)]);
         assert!(emulation.destroy_bounded(0).await);
     }
 

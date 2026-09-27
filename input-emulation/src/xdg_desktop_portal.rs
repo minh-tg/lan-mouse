@@ -20,6 +20,14 @@ use crate::error::EmulationError;
 
 use super::{Emulation, EmulationHandle, error::XdpEmulationCreationError};
 
+fn is_release_transition(event: input_event::Event) -> bool {
+    matches!(
+        event,
+        Keyboard(KeyboardEvent::Key { state: 0, .. })
+            | Pointer(PointerEvent::Button { state: 0, .. })
+    )
+}
+
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
     session: Session<RemoteDesktop>,
@@ -151,6 +159,22 @@ impl Emulation for DesktopPortalEmulation {
         Ok(())
     }
 
+    async fn retry_pending(
+        &mut self,
+        event: input_event::Event,
+        client: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        // A D-Bus call may have reached the portal before cancellation. Repeating a
+        // press could generate an extra key repeat, so treat it as submitted; a release
+        // is safe to resend. A press cancelled before send may be missed, but cleanup
+        // still releases its tracked state.
+        if is_release_transition(event) {
+            self.consume(event, client).await
+        } else {
+            Ok(())
+        }
+    }
+
     async fn create(&mut self, _client: EmulationHandle) {}
     async fn destroy(&mut self, _client: EmulationHandle) {}
     async fn terminate(&mut self) {
@@ -178,5 +202,34 @@ impl AsyncDrop for DesktopPortalEmulation {
             let _ = self.session.close().await;
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_resends_releases_but_not_presses() {
+        assert!(is_release_transition(Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 0,
+        })));
+        assert!(!is_release_transition(Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        })));
+        assert!(is_release_transition(Pointer(PointerEvent::Button {
+            time: 0,
+            button: 1,
+            state: 0,
+        })));
+        assert!(!is_release_transition(Pointer(PointerEvent::Button {
+            time: 0,
+            button: 1,
+            state: 1,
+        })));
     }
 }

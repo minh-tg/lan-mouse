@@ -268,6 +268,17 @@ impl Emulation for LibeiEmulation {
         Ok(())
     }
 
+    async fn retry_pending(
+        &mut self,
+        _event: Event,
+        _handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        // The original event is already in reis's write buffer. Flush it rather than
+        // appending a second copy when the caller retries after cancellation.
+        retry_pending_context(&self.context, &self.write_ready).await?;
+        Ok(())
+    }
+
     async fn create(&mut self, _: EmulationHandle) {}
     async fn destroy(&mut self, _: EmulationHandle) {}
 
@@ -295,6 +306,14 @@ async fn flush_context(context: &ei::Context, write_ready: &AsyncFd<OwnedFd>) ->
             Err(e) => return Err(io::Error::new(e.kind(), e)),
         }
     }
+}
+
+/// Resume output left in reis's write buffer without appending the event again.
+async fn retry_pending_context(
+    context: &ei::Context,
+    write_ready: &AsyncFd<OwnedFd>,
+) -> io::Result<()> {
+    flush_context(context, write_ready).await
 }
 
 async fn ei_task(
@@ -449,7 +468,7 @@ mod tests {
 
         peer.set_nonblocking(true).unwrap();
         let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
-        let flush = flush_context(&context, &write_ready);
+        let flush = retry_pending_context(&context, &write_ready);
         tokio::pin!(flush);
 
         // The peer is not draining yet, so the flush must stay pending.
