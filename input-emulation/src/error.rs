@@ -35,6 +35,18 @@ pub enum EmulationError {
     Io(#[from] io::Error),
 }
 
+impl EmulationError {
+    /// Returns whether the backend failed because its output socket is temporarily full.
+    pub fn is_would_block(&self) -> bool {
+        match self {
+            Self::Io(error) => error.kind() == io::ErrorKind::WouldBlock,
+            #[cfg(wlroots)]
+            Self::Wayland(WaylandError::Io(error)) => error.kind() == io::ErrorKind::WouldBlock,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EmulationCreationError {
     #[cfg(wlroots)]
@@ -155,3 +167,25 @@ pub enum MacOSEmulationCreationError {
 #[cfg(windows)]
 #[derive(Debug, Error)]
 pub enum WindowsEmulationCreationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emulation_error_identifies_would_block() {
+        let io_error = EmulationError::Io(io::Error::from(io::ErrorKind::WouldBlock));
+        assert!(io_error.is_would_block());
+
+        let other_io_error = EmulationError::Io(io::Error::from(io::ErrorKind::Other));
+        assert!(!other_io_error.is_would_block());
+
+        #[cfg(wlroots)]
+        {
+            let wayland_error = EmulationError::Wayland(WaylandError::Io(io::Error::from(
+                io::ErrorKind::WouldBlock,
+            )));
+            assert!(wayland_error.is_would_block());
+        }
+    }
+}

@@ -46,6 +46,10 @@ pub(crate) enum ListenEvent {
     Rejected {
         fingerprint: String,
     },
+    /// the underlying transport for `addr` actually closed
+    Closed {
+        addr: SocketAddr,
+    },
 }
 
 pub(crate) struct LanMouseListener {
@@ -273,6 +277,9 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
+    // Report the real close so the emulation side can prune per-address
+    // bookkeeping (e.g. an overflow block) instead of retaining it forever.
+    let _ = dtls_tx.send(ListenEvent::Closed { addr });
     let mut conns = conns.lock().await;
     let index = conns
         .iter()
