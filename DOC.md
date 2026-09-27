@@ -33,7 +33,8 @@ the standardized event format.
 
 ### Dispatcher
 The dispatcher component takes events from the event receiver and passes them
-to the correct backend corresponding to the type of client.
+to the correct backend corresponding to the type of client. If the libei socket
+is full, the backend waits up to 5 seconds for room instead of failing right away.
 
 
 ## Requests

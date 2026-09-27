@@ -1,15 +1,21 @@
 use futures::{StreamExt, future};
 use std::{
     env, fs, io,
-    os::{fd::OwnedFd, unix::net::UnixStream},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{Interest, unix::AsyncFd},
+    task::JoinHandle,
+};
 
 use ashpd::desktop::{
     PersistMode, Session,
@@ -42,6 +48,8 @@ struct Devices {
 
 pub(crate) struct LibeiEmulation {
     context: ei::Context,
+    /// Readiness for the libei socket, used to retry a flush that hit `WouldBlock`.
+    write_ready: Arc<AsyncFd<OwnedFd>>,
     conn: event::Connection,
     devices: Devices,
     ei_task: JoinHandle<()>,
@@ -130,10 +138,17 @@ impl LibeiEmulation {
         let devices = Devices::default();
         let libei_error = Arc::new(AtomicBool::default());
         let error = Arc::new(Mutex::new(None));
+        // Register a duplicate of the socket for writable readiness: the original fd
+        // is already registered for readability by the reis event stream.
+        let write_ready = Arc::new(AsyncFd::with_interest(
+            context.as_fd().try_clone_to_owned()?,
+            Interest::WRITABLE,
+        )?);
         let ei_handler = ei_task(
             events,
             conn.clone(),
             context.clone(),
+            write_ready.clone(),
             devices.clone(),
             libei_error.clone(),
             error.clone(),
@@ -142,6 +157,7 @@ impl LibeiEmulation {
 
         Ok(Self {
             context,
+            write_ready,
             conn,
             devices,
             ei_task,
@@ -248,9 +264,7 @@ impl Emulation for LibeiEmulation {
                 KeyboardEvent::Modifiers { .. } => {}
             },
         }
-        self.context
-            .flush()
-            .map_err(|e| io::Error::new(e.kind(), e))?;
+        flush_context(&self.context, &self.write_ready, FLUSH_TIMEOUT).await?;
         Ok(())
     }
 
@@ -263,16 +277,58 @@ impl Emulation for LibeiEmulation {
     }
 }
 
+/// How long a flush may wait for the socket to accept data before giving up.
+///
+/// Without a limit, a compositor that stops reading would block the emulation task, and
+/// with it removing clients and shutting down.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Flushes buffered libei requests, waiting for the socket to become writable on `WouldBlock`.
+///
+/// `reis` only drains the bytes the kernel accepted and keeps the unsent suffix in
+/// its write buffer when a socket write reports `WouldBlock`
+/// (`wire::backend::Buffer::flush_write`), so flushing again once the socket becomes
+/// writable resumes the buffered messages instead of dropping them.
+///
+/// Returns a `TimedOut` error if the socket is still full after `timeout`.
+async fn flush_context(
+    context: &ei::Context,
+    write_ready: &AsyncFd<OwnedFd>,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match context.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // The kernel send buffer is full; wait until it accepts more data and
+                // resume the buffered flush afterwards.
+                match tokio::time::timeout_at(deadline, write_ready.writable()).await {
+                    Ok(guard) => guard?.clear_ready(),
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "libei socket stayed full",
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), e)),
+        }
+    }
+}
+
 async fn ei_task(
     mut events: EiConvertEventStream,
     _conn: Connection,
     context: ei::Context,
+    write_ready: Arc<AsyncFd<OwnedFd>>,
     devices: Devices,
     libei_error: Arc<AtomicBool>,
     error: Arc<Mutex<Option<EmulationError>>>,
 ) {
     loop {
-        match ei_event_handler(&mut events, &context, &devices).await {
+        match ei_event_handler(&mut events, &context, &write_ready, &devices).await {
             Ok(()) => {}
             Err(e) => {
                 libei_error.store(true, Ordering::SeqCst);
@@ -287,6 +343,7 @@ async fn ei_task(
 async fn ei_event_handler(
     events: &mut EiConvertEventStream,
     context: &ei::Context,
+    write_ready: &AsyncFd<OwnedFd>,
     devices: &Devices,
 ) -> Result<(), EmulationError> {
     loop {
@@ -372,6 +429,101 @@ async fn ei_event_handler(
             // EiEvent::TouchMotion(_) => { },
             _ => unreachable!("unexpected ei event"),
         }
-        context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
+        flush_context(context, write_ready, FLUSH_TIMEOUT).await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Larger than the default unix socket send buffer (typically ~200 KiB), so a
+    /// single buffered message cannot be flushed in one go.
+    const FILL_PAYLOAD: usize = 4 << 20;
+
+    /// A libei context whose send buffer is full, with `payload` still waiting to be sent.
+    ///
+    /// The returned `AsyncFd` keeps the read registration alive, like `reis` does in
+    /// production.
+    fn full_socket() -> (
+        AsyncFd<UnixStream>,
+        ei::Context,
+        AsyncFd<OwnedFd>,
+        UnixStream,
+    ) {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        // Mimic the production layout: reis registers the socket for read readiness
+        // while the write readiness uses a duplicate of the same socket.
+        let read_ready = AsyncFd::with_interest(socket, Interest::READABLE).unwrap();
+        let context = ei::Context::new(read_ready.get_ref().try_clone().unwrap()).unwrap();
+        let write_ready = AsyncFd::with_interest(
+            context.as_fd().try_clone_to_owned().unwrap(),
+            Interest::WRITABLE,
+        )
+        .unwrap();
+
+        // Buffer a message larger than the send buffer, then flush once: the kernel
+        // accepts a prefix and reports `WouldBlock` for the rest, which reis keeps.
+        let payload = "x".repeat(FILL_PAYLOAD);
+        context.handshake().interface_version(&payload, 1);
+        let err = context
+            .flush()
+            .expect_err("flushing a full send buffer must report WouldBlock");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        (read_ready, context, write_ready, peer)
+    }
+
+    /// A full kernel send buffer must not drop buffered events: `flush_context`
+    /// observes `WouldBlock`, waits for writable readiness and resumes the flush once
+    /// the peer drains the socket.
+    #[tokio::test]
+    async fn flush_resumes_after_would_block() {
+        let (_read_ready, context, write_ready, peer) = full_socket();
+
+        peer.set_nonblocking(true).unwrap();
+        let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+        let flush = flush_context(&context, &write_ready, Duration::from_secs(10));
+        tokio::pin!(flush);
+
+        // The peer is not draining yet, so the flush must stay pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut flush)
+                .await
+                .is_err(),
+            "flush returned although the send buffer is still full"
+        );
+
+        // Drain the peer and require the whole buffered payload to arrive within a
+        // bounded time; an EOF instead of the payload must fail loudly, not hang.
+        let drain = async move {
+            let mut seen = 0usize;
+            let mut buf = [0u8; 64 * 1024];
+            while seen < FILL_PAYLOAD {
+                let n = peer.read(&mut buf).await.expect("peer read failed");
+                assert!(n > 0, "peer reached EOF before the flush completed");
+                seen += buf[..n].iter().filter(|&&b| b == b'x').count();
+            }
+            seen
+        };
+
+        let (flush_result, payload_bytes) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(&mut flush, drain)
+        })
+        .await
+        .expect("buffered flush did not resume within the timeout");
+        flush_result.expect("retrying flush failed");
+        assert_eq!(payload_bytes, FILL_PAYLOAD);
+    }
+
+    /// A peer that never reads must not stall the caller forever.
+    #[tokio::test]
+    async fn flush_times_out_when_socket_stays_full() {
+        let (_read_ready, context, write_ready, _peer) = full_socket();
+
+        let err = flush_context(&context, &write_ready, Duration::from_millis(100))
+            .await
+            .expect_err("flush must give up while the socket stays full");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
