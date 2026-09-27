@@ -138,9 +138,24 @@ impl Emulation for WlrootsEmulation {
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
+            // Dropping a keyboard key or pointer button transition would leave the remote
+            // side in a stuck state, so those are essential: when the wayland output buffer
+            // is full the error is propagated instead of silently discarding the event.
+            // Stateless pointer motion and axis events may be dropped.
+            let essential = matches!(
+                event,
+                Event::Keyboard(_) | Event::Pointer(PointerEvent::Button { .. })
+            );
+
             if self.last_flush_failed {
                 match self.queue.flush() {
                     Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if essential {
+                            log::warn!(
+                                "wayland output buffer full, cannot deliver essential event: ({handle}) - {event:?}"
+                            );
+                            return Err(WaylandError::Io(e).into());
+                        }
                         /*
                          * outgoing buffer is full - sending more events
                          * will overwhelm the output buffer and leave the
@@ -158,6 +173,12 @@ impl Emulation for WlrootsEmulation {
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
+                    if essential {
+                        log::warn!(
+                            "wayland output buffer full, cannot deliver essential event: ({handle}) - {event:?}"
+                        );
+                        return Err(WaylandError::Io(e).into());
+                    }
                     log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                 }
                 Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
