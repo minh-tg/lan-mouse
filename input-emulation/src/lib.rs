@@ -444,8 +444,12 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
-    /// Resume a cancelled transition. Backends that buffer output before awaiting can
-    /// flush the existing buffer instead of submitting the same transition twice.
+    /// Retry a transition whose `consume` future was cancelled before completion.
+    ///
+    /// The default calls `consume` again, which is safe only when cancellation
+    /// guarantees that the event was not submitted. Backends that may buffer or hand
+    /// off the event before suspending must override this method to resume it without
+    /// duplicating the transition.
     async fn retry_pending(
         &mut self,
         event: Event,

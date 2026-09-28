@@ -504,6 +504,10 @@ impl Emulation for MacOSEmulation {
                     if is_modifier {
                         modifier_event(self.event_source.clone(), self.modifier_state.get());
                     }
+                    // The key event is posted only after the repeat-task await. A
+                    // cancelled release is completed by that task before it exits, so
+                    // the default retry cannot duplicate a key transition. Modifier
+                    // state is updated synchronously above and reposting it is idempotent.
                     match state {
                         // pressed
                         1 => self.spawn_repeat_task(code).await,

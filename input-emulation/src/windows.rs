@@ -60,6 +60,9 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
+                    // The repeat helpers do not suspend, so this key transition is
+                    // posted before `consume` can be cancelled. If they start awaiting,
+                    // override `retry_pending` to avoid submitting it twice.
                     match state {
                         // pressed
                         0 => self.kill_repeat_task(),
