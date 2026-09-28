@@ -38,10 +38,13 @@ The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client. Its 1024-event input
 queue is bounded: adjacent relative pointer-motion events may be coalesced, and
 stateless pointer traffic may be dropped at capacity. A source that overflows on
-an essential key/button event is failed closed and cleaned up. The libei backend
-waits for socket writability and retries `WouldBlock`; on other backends, a
-`WouldBlock` fails only the affected source closed. Held keys and buttons are
-released on removal; if bounded cleanup fails, the backend is reset.
+an essential key/button event is failed closed and cleaned up; it stays muted
+until it re-enters, reconnects, goes inactive, or five seconds pass. The libei
+backend waits for socket writability and retries `WouldBlock`; on other backends,
+a `WouldBlock` fails only the affected source closed. Held keys and buttons are
+released on removal; if bounded cleanup fails, the backend is reset. Pending
+input from the previous session is discarded when a fresh session starts, so a
+queued press cannot outlive a dropped release.
 
 
 ## Requests

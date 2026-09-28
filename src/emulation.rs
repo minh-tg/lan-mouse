@@ -7,7 +7,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -26,6 +26,10 @@ const MAX_QUEUED_INPUTS: usize = 1024;
 /// Maximum number of per-source cleanup controls queued before the pipeline
 /// falls back to a single global reset.
 const MAX_QUEUED_REMOVALS: usize = 64;
+
+/// How long a source that was failed closed stays muted before it may drive
+/// input again.
+const BLOCKED_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
@@ -372,6 +376,10 @@ impl EmulationTask {
         );
 
         loop {
+            // Pending events belong to the previous backend/session. Its matching
+            // releases may have been discarded while emulation was disabled; replaying
+            // only the queued presses could leave input held in this session.
+            self.admission.borrow_mut().discard_pending_inputs();
             self.create_clients(&mut emulation).await;
             match self.do_emulation_session(&mut emulation).await {
                 Ok(SessionEnd::Terminated) => break,
@@ -578,8 +586,9 @@ struct Admission {
     reset_all: bool,
     terminate: bool,
     reenable: bool,
-    /// Sources blocked after overflow until they re-enter, reconnect, or go inactive.
-    blocked: HashSet<SocketAddr>,
+    /// Sources blocked after overflow, with the time each block began. A block is
+    /// also cleared on re-entry, reconnect, or inactivity.
+    blocked: HashMap<SocketAddr, Instant>,
     /// Woken when new input is queued.
     input_wake: Rc<Notify>,
     /// Woken when a priority control is queued.
@@ -627,7 +636,7 @@ impl Admission {
             reset_all: false,
             terminate: false,
             reenable: false,
-            blocked: HashSet::new(),
+            blocked: HashMap::new(),
             input_wake: Rc::new(Notify::new()),
             control_wake: Rc::new(Notify::new()),
         }
@@ -635,8 +644,8 @@ impl Admission {
 
     fn admit(&mut self, addr: SocketAddr, event: Event) -> Admitted {
         // A source that overflowed stays blocked until it re-enters, reconnects,
-        // or is declared inactive.
-        if self.blocked.contains(&addr) {
+        // is declared inactive, or its bounded mute period expires.
+        if self.is_muted(addr) {
             return Admitted::Dropped;
         }
         if coalesce_relative_motion(&mut self.inputs, addr, &event) {
@@ -660,11 +669,24 @@ impl Admission {
         Admitted::FailedClosed
     }
 
+    /// Whether a source's overflow block is still active. Expired entries are
+    /// removed when the source next sends input.
+    fn is_muted(&mut self, addr: SocketAddr) -> bool {
+        let Some(blocked_since) = self.blocked.get(&addr) else {
+            return false;
+        };
+        if blocked_since.elapsed() < BLOCKED_SOURCE_TIMEOUT {
+            return true;
+        }
+        self.blocked.remove(&addr);
+        false
+    }
+
     /// Fail a source closed after an essential overflow or transient backend
     /// WouldBlock, and schedule its ordered cleanup.
     fn fail_source_closed(&mut self, addr: SocketAddr) {
         self.drop_source_inputs(addr);
-        self.blocked.insert(addr);
+        self.blocked.insert(addr, Instant::now());
         self.schedule_removal(addr);
         self.control_wake.notify_one();
     }
@@ -734,7 +756,7 @@ impl Admission {
         self.in_flight = false;
         if self.terminate
             || self.reset_all
-            || self.blocked.contains(&input.addr)
+            || self.blocked.contains_key(&input.addr)
             || self.removals.contains(&input.addr)
         {
             // The pending barrier supersedes this pre-barrier input.
@@ -787,6 +809,13 @@ impl Admission {
 
     fn drop_source_inputs(&mut self, addr: SocketAddr) {
         self.inputs.retain(|queued| queued.addr != addr);
+    }
+
+    /// Drop queued input at a session boundary, including any reserved in-flight
+    /// slot left by an interrupted input.
+    fn discard_pending_inputs(&mut self) {
+        self.inputs.clear();
+        self.in_flight = false;
     }
 }
 
@@ -971,7 +1000,7 @@ mod tests {
         assert!(before_b > 0);
 
         assert_eq!(admission.admit(a, key(30)), Admitted::FailedClosed);
-        assert!(admission.blocked.contains(&a));
+        assert!(admission.blocked.contains_key(&a));
         // Only the overflowing source is discarded; the other source survives.
         assert_eq!(admission.inputs.iter().filter(|q| q.addr == a).count(), 0);
         assert_eq!(
@@ -994,7 +1023,7 @@ mod tests {
             std::io::ErrorKind::WouldBlock,
         ));
         assert!(handle_consume_error(&mut admission, a, error).is_ok());
-        assert!(admission.blocked.contains(&a));
+        assert!(admission.blocked.contains_key(&a));
         assert_eq!(admission.removals, VecDeque::from([a]));
         assert_eq!(admission.inputs.len(), 1);
         assert_eq!(admission.inputs[0].addr, b);
@@ -1009,7 +1038,7 @@ mod tests {
             let mut admission = Admission::new();
             fill_alternating(&mut admission);
             assert_eq!(admission.admit(addr(1), essential), Admitted::FailedClosed);
-            assert!(admission.blocked.contains(&addr(1)));
+            assert!(admission.blocked.contains_key(&addr(1)));
         }
     }
 
@@ -1151,20 +1180,76 @@ mod tests {
 
         // Overflow blocks a.
         admission.admit(a, key(30));
-        assert!(admission.blocked.contains(&a));
+        assert!(admission.blocked.contains_key(&a));
 
         // A generic removal is an ordering barrier, not proof that the source
         // is inactive, so it must not clear the block.
         admission.request_remove(a);
-        assert!(admission.blocked.contains(&a));
+        assert!(admission.blocked.contains_key(&a));
 
         // A liveness timeout or transport close clears stale block metadata.
         // Re-entry/reconnect also clears the block and admits input again.
         admission.note_source_inactive(a);
-        assert!(!admission.blocked.contains(&a));
+        assert!(!admission.blocked.contains_key(&a));
         assert_eq!(admission.removals, VecDeque::from([a]));
         assert_eq!(admission.admit(a, motion(1.0, 2.0)), Admitted::Queued);
         assert_eq!(admission.inputs.back().map(|q| q.addr), Some(a));
+    }
+
+    #[test]
+    fn overflow_block_expires_after_timeout() {
+        let a = addr(1);
+        let mut admission = Admission::new();
+        fill_alternating(&mut admission);
+
+        assert_eq!(admission.admit(a, key(30)), Admitted::FailedClosed);
+        assert_eq!(admission.admit(a, motion(1.0, 0.0)), Admitted::Dropped);
+
+        // A source that stays connected remains muted before the timeout.
+        admission.blocked.insert(
+            a,
+            Instant::now() - (BLOCKED_SOURCE_TIMEOUT - Duration::from_secs(1)),
+        );
+        assert_eq!(admission.admit(a, motion(1.0, 0.0)), Admitted::Dropped);
+        assert!(admission.blocked.contains_key(&a));
+
+        // Once the full mute period has elapsed, the next event may be admitted.
+        admission
+            .blocked
+            .insert(a, Instant::now() - BLOCKED_SOURCE_TIMEOUT);
+        assert_eq!(admission.admit(a, motion(1.0, 0.0)), Admitted::Queued);
+        assert!(!admission.blocked.contains_key(&a));
+    }
+
+    #[test]
+    fn session_start_discards_stale_input() {
+        let source = addr(1);
+        let press = key(30);
+        let release = Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 0,
+        });
+        let mut admission = Admission::new();
+        assert_eq!(admission.admit(source, press), Admitted::Queued);
+        assert_eq!(admission.admit(source, release), Admitted::Queued);
+        assert_eq!(
+            admission.take_input(),
+            Some(QueuedInput {
+                addr: source,
+                event: press,
+            })
+        );
+        assert_eq!(
+            admission.inputs.front().map(|queued| queued.event),
+            Some(release)
+        );
+
+        admission.discard_pending_inputs();
+
+        assert!(admission.inputs.is_empty());
+        assert!(!admission.in_flight);
+        assert_eq!(admission.admit(source, key(31)), Admitted::Queued);
     }
 
     #[tokio::test]
