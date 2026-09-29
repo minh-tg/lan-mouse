@@ -41,8 +41,10 @@ stateless pointer traffic may be dropped at capacity. A source that overflows on
 an essential key/button event is failed closed and cleaned up; it stays muted
 until it re-enters, reconnects, goes inactive, or five seconds pass. The libei
 backend waits for socket writability and retries `WouldBlock`; on other backends,
-a `WouldBlock` fails only the affected source closed. Held keys and buttons are
-released on removal; if bounded cleanup fails, the backend is reset. Pending
+a `WouldBlock` fails only the affected source closed. The Windows backend gives up
+on a refused `SendInput` after a few attempts and fails only the affected source
+closed, so a blocked injection cannot stall the dispatcher. Held keys and buttons
+are released on removal; if bounded cleanup fails, the backend is reset. Pending
 input from the previous session is discarded when a fresh session starts, so a
 queued press cannot outlive a dropped release.
 

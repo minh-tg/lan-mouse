@@ -485,8 +485,8 @@ impl EmulationTask {
             })
             .await;
             if let Ok(Err(error)) = result {
-                // A transient WouldBlock fails only this source closed; other
-                // backend errors still terminate the session.
+                // A transient backend failure (for example a full output buffer)
+                // fails only this source closed; other errors terminate the session.
                 handle_consume_error(&mut admission.borrow_mut(), item.addr, error)?;
             }
         }
@@ -619,7 +619,7 @@ fn handle_consume_error(
     addr: SocketAddr,
     error: input_emulation::EmulationError,
 ) -> Result<(), input_emulation::EmulationError> {
-    if error.is_would_block() {
+    if error.is_transient() {
         admission.fail_source_closed(addr);
         Ok(())
     } else {
@@ -682,8 +682,8 @@ impl Admission {
         false
     }
 
-    /// Fail a source closed after an essential overflow or transient backend
-    /// WouldBlock, and schedule its ordered cleanup.
+    /// Fail a source closed after an essential overflow or a transient backend
+    /// failure, and schedule its ordered cleanup.
     fn fail_source_closed(&mut self, addr: SocketAddr) {
         self.drop_source_inputs(addr);
         self.blocked.insert(addr, Instant::now());
@@ -1013,20 +1013,30 @@ mod tests {
     }
 
     #[test]
-    fn transient_backend_would_block_fails_only_its_source_closed() {
+    fn transient_backend_failure_fails_only_its_source_closed() {
         let a = addr(1);
         let b = addr(2);
+        let c = addr(3);
         let mut admission = Admission::new();
         assert_eq!(admission.admit(b, motion(1.0, 0.0)), Admitted::Queued);
 
-        let error = input_emulation::EmulationError::Io(std::io::Error::from(
+        // Backpressure (WouldBlock) and an OS-refused injection (InputRefused) are both
+        // transient: only the failing source is dropped so that it can be retried later.
+        let would_block = input_emulation::EmulationError::Io(std::io::Error::from(
             std::io::ErrorKind::WouldBlock,
         ));
-        assert!(handle_consume_error(&mut admission, a, error).is_ok());
+        assert!(handle_consume_error(&mut admission, a, would_block).is_ok());
         assert!(admission.blocked.contains_key(&a));
         assert_eq!(admission.removals, VecDeque::from([a]));
         assert_eq!(admission.inputs.len(), 1);
         assert_eq!(admission.inputs[0].addr, b);
+
+        let refused = input_emulation::EmulationError::InputRefused(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        assert!(handle_consume_error(&mut admission, c, refused).is_ok());
+        assert!(admission.blocked.contains_key(&c));
+        assert_eq!(admission.removals, VecDeque::from([a, c]));
 
         let fatal = input_emulation::EmulationError::EndOfStream;
         assert!(handle_consume_error(&mut admission, b, fatal).is_err());

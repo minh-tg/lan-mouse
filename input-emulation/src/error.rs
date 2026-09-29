@@ -33,13 +33,26 @@ pub enum EmulationError {
     Ashpd(#[from] ashpd::Error),
     #[error("io error: `{0}`")]
     Io(#[from] io::Error),
+    /// The operating system refused to inject the event, for example `SendInput` while
+    /// a higher-integrity window has focus. The refusal may clear on its own, so only
+    /// the affected source is dropped and retried later.
+    #[error("input injection was refused: `{0}`")]
+    InputRefused(io::Error),
 }
 
 impl EmulationError {
-    /// Returns whether the backend failed because its output socket is temporarily full.
-    pub fn is_would_block(&self) -> bool {
+    /// Returns whether the failure may clear on its own and only affects the event's
+    /// source, so the caller can drop that source's input and retry it later.
+    ///
+    /// This covers an output socket that is momentarily full (`WouldBlock`) and an
+    /// event the operating system refused to inject
+    /// ([`InputRefused`](Self::InputRefused)).
+    pub fn is_transient(&self) -> bool {
         match self {
             Self::Io(error) => error.kind() == io::ErrorKind::WouldBlock,
+            // The classification comes from the variant, not the error kind: the OS
+            // error reported for a refused injection is not a reliable indicator.
+            Self::InputRefused(_) => true,
             #[cfg(wlroots)]
             Self::Wayland(WaylandError::Io(error)) => error.kind() == io::ErrorKind::WouldBlock,
             _ => false,
@@ -173,19 +186,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emulation_error_identifies_would_block() {
+    fn emulation_error_identifies_transient_failures() {
         let io_error = EmulationError::Io(io::Error::from(io::ErrorKind::WouldBlock));
-        assert!(io_error.is_would_block());
+        assert!(io_error.is_transient());
+
+        // A refused injection is transient even though its error kind is not
+        // `WouldBlock`: the classification comes from the variant.
+        let refused =
+            EmulationError::InputRefused(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(refused.is_transient());
 
         let other_io_error = EmulationError::Io(io::Error::from(io::ErrorKind::Other));
-        assert!(!other_io_error.is_would_block());
+        assert!(!other_io_error.is_transient());
 
         #[cfg(wlroots)]
         {
             let wayland_error = EmulationError::Wayland(WaylandError::Io(io::Error::from(
                 io::ErrorKind::WouldBlock,
             )));
-            assert!(wayland_error.is_would_block());
+            assert!(wayland_error.is_transient());
         }
     }
 }
